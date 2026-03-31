@@ -15,33 +15,36 @@
 */
 
 #include <fcntl.h>
-#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "utils.h"
+#include <optional>
+#include <string>
 
-/* reads a file, making sure it is terminated with \n \0 */
-char* read_file(const char* fn) {
+#include "utils.hpp"
+
+std::optional<std::string> read_file(const std::string& path) noexcept {
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return std::nullopt;
+
+    // RAII file descriptor guard
+    struct FdGuard {
+        int fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } guard{fd};
+
     struct stat st;
-    char* data = NULL;
+    if (fstat(fd, &st) != 0) return std::nullopt;
 
-    int fd = open(fn, O_RDONLY);
-    if (fd < 0) return data;
+    std::string data;
+    data.resize(st.st_size + 2);
 
-    if (fstat(fd, &st)) goto oops;
+    const ssize_t bytes_read = read(fd, data.data(), st.st_size);
+    if (bytes_read != st.st_size) return std::nullopt;
 
-    data = malloc(st.st_size + 2);
-    if (!data) goto oops;
-
-    if (read(fd, data, st.st_size) != st.st_size) goto oops;
-    close(fd);
     data[st.st_size] = '\n';
-    data[st.st_size + 1] = 0;
+    data[st.st_size + 1] = '\0';
     return data;
-
-oops:
-    close(fd);
-    if (data) free(data);
-    return NULL;
 }

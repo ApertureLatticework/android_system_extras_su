@@ -1,0 +1,35 @@
+// Android.bp - Soong build configuration for su binary
+// Converted from Android.mk for C++17 support
+
+cc_binary {
+    name: "su",
+
+    srcs: [
+        "su.cpp",
+        "daemon.cpp",
+        "utils.cpp",
+        "pts.cpp",
+        "binder/appops-wrapper.cpp",
+        "binder/pm-wrapper.cpp",
+    ],
+
+    shared_libs: [
+        "libbinder",
+        "libcutils",
+        "liblog",
+        "libutils",
+    ],
+
+    cflags: [
+        "-Werror",
+        "-Wall",
+        "-Wextra",
+    ],
+
+    cpp_std: "c++17",
+
+    // Create symlink /system/bin/su -> /system/xbin/su
+    symlinks: ["su"],
+
+    init_rc: ["superuser.rc"],
+}

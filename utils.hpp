@@ -14,10 +14,17 @@
 ** limitations under the License.
 */
 
-#ifndef _UTILS_H_
-#define _UTILS_H_
+#pragma once
 
-/* reads a file, making sure it is terminated with \n \0 */
-extern char* read_file(const char* fn);
+#include <optional>
+#include <string>
 
-#endif
+/**
+ * Reads a file and returns its content as a string.
+ * The content is guaranteed to be terminated with "\n\0".
+ *
+ * @param path The path to the file to read
+ * @return std::optional<std::string> containing the file content on success,
+ *         or std::nullopt on failure
+ */
+[[nodiscard]] std::optional<std::string> read_file(const std::string& path) noexcept;

@@ -15,40 +15,63 @@
 ** limitations under the License.
 */
 
-#include <stdlib.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <log/log.h>
 
-#include "pts.h"
-#include "su.h"
-#include "utils.h"
+#include <array>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
-int is_daemon = 0;
-int daemon_from_uid = 0;
-int daemon_from_pid = 0;
+#include "pts.hpp"
+#include "su.hpp"
+#include "utils.hpp"
+
+namespace {
+
+bool is_daemon = false;
+uid_t daemon_from_uid = 0;
+pid_t daemon_from_pid = 0;
 
 // Constants for the atty bitfield
-#define ATTY_IN 1
-#define ATTY_OUT 2
-#define ATTY_ERR 4
+constexpr int ATTY_IN = 1;
+constexpr int ATTY_OUT = 2;
+constexpr int ATTY_ERR = 4;
 
-/*
+// List of signals which cause process termination
+constexpr std::array<int, 7> quit_signals = {
+    SIGALRM, SIGHUP, SIGPIPE, SIGQUIT, SIGTERM, SIGINT, 0
+};
+
+// RAII wrapper for file descriptors
+struct FdGuard {
+    int fd;
+    explicit FdGuard(int f) : fd(f) {}
+    ~FdGuard() { if (fd >= 0) close(fd); }
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+};
+
+}  // namespace
+
+/**
  * Receive a file descriptor from a Unix socket.
  * Contributed by @mkasick
  *
  * Returns the file descriptor on success, or -1 if a file
  * descriptor was not actually included in the message
- *
- * On error the function terminates by calling exit(-1)
  */
 static int recv_fd(int sockfd) {
-    // Need to receive data from the message, otherwise don't care about it.
     char iovbuf;
 
     struct iovec iov = {
@@ -56,13 +79,13 @@ static int recv_fd(int sockfd) {
         .iov_len = 1,
     };
 
-    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+    std::array<char, CMSG_SPACE(sizeof(int))> cmsgbuf{};
 
     struct msghdr msg = {
         .msg_iov = &iov,
         .msg_iovlen = 1,
-        .msg_control = cmsgbuf,
-        .msg_controllen = sizeof(cmsgbuf),
+        .msg_control = cmsgbuf.data(),
+        .msg_controllen = cmsgbuf.size(),
     };
 
     if (recvmsg(sockfd, &msg, MSG_WAITALL) != 1) {
@@ -72,10 +95,10 @@ static int recv_fd(int sockfd) {
     // Was a control message actually sent?
     switch (msg.msg_controllen) {
         case 0:
-            // No, so the file descriptor was closed and won't be used.
+            // No, so the file descriptor was closed and won't be used
             return -1;
-        case sizeof(cmsgbuf):
-            // Yes, grab the file descriptor from it.
+        case CMSG_SPACE(sizeof(int)):
+            // Yes, grab the file descriptor from it
             break;
         default:
             goto error;
@@ -83,33 +106,30 @@ static int recv_fd(int sockfd) {
 
     struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
 
-    if (cmsg == NULL ||
+    if (cmsg == nullptr ||
         cmsg->cmsg_len != CMSG_LEN(sizeof(int)) ||
         cmsg->cmsg_level != SOL_SOCKET ||
         cmsg->cmsg_type != SCM_RIGHTS) {
         goto error;
     }
 
-    return *(int*)CMSG_DATA(cmsg);
+    return *static_cast<int*>(static_cast<void*>(CMSG_DATA(cmsg)));
 
 error:
     ALOGE("unable to read fd");
     exit(-1);
 }
 
-/*
+/**
  * Send a file descriptor through a Unix socket.
  * Contributed by @mkasick
- *
- * On error the function terminates by calling exit(-1)
  *
  * fd may be -1, in which case the dummy data is sent,
  * but no control message with the FD is sent.
  */
 static void send_fd(int sockfd, int fd) {
-    // Need to send some data in the message, this will do.
     struct iovec iov = {
-        .iov_base = "",
+        .iov_base = const_cast<char*>(""),
         .iov_len = 1,
     };
 
@@ -118,7 +138,7 @@ static void send_fd(int sockfd, int fd) {
         .msg_iovlen = 1,
     };
 
-    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+    std::array<char, CMSG_SPACE(sizeof(int))> cmsgbuf{};
 
     if (fd != -1) {
         // Is the file descriptor actually open?
@@ -126,11 +146,11 @@ static void send_fd(int sockfd, int fd) {
             if (errno != EBADF) {
                 goto error;
             }
-            // It's closed, don't send a control message or sendmsg will EBADF.
+            // It's closed, don't send a control message
         } else {
-            // It's open, send the file descriptor in a control message.
-            msg.msg_control = cmsgbuf;
-            msg.msg_controllen = sizeof(cmsgbuf);
+            // It's open, send the file descriptor in a control message
+            msg.msg_control = cmsgbuf.data();
+            msg.msg_controllen = cmsgbuf.size();
 
             struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
             if (!cmsg) {
@@ -141,14 +161,13 @@ static void send_fd(int sockfd, int fd) {
             cmsg->cmsg_level = SOL_SOCKET;
             cmsg->cmsg_type = SCM_RIGHTS;
 
-            *(int*)CMSG_DATA(cmsg) = fd;
+            *static_cast<int*>(static_cast<void*>(CMSG_DATA(cmsg))) = fd;
         }
     }
 
     if (sendmsg(sockfd, &msg, 0) != 1) {
         goto error;
     }
-
     return;
 
 error:
@@ -158,35 +177,30 @@ error:
 
 static int read_int(int fd) {
     int val;
-    int len = read(fd, &val, sizeof(int));
+    ssize_t len = read(fd, &val, sizeof(int));
     if (len != sizeof(int)) {
-        ALOGE("unable to read int: %d", len);
+        ALOGE("unable to read int: %zd", len);
         exit(-1);
     }
     return val;
 }
 
 static void write_int(int fd, int val) {
-    int written = write(fd, &val, sizeof(int));
+    ssize_t written = write(fd, &val, sizeof(int));
     if (written != sizeof(int)) {
         PLOGE("unable to write int");
         exit(-1);
     }
 }
 
-static char* read_string(int fd) {
+static std::string read_string(int fd) {
     int len = read_int(fd);
     if (len > PATH_MAX || len < 0) {
         ALOGE("invalid string length %d", len);
         exit(-1);
     }
-    char* val = malloc(sizeof(char) * (len + 1));
-    if (val == NULL) {
-        ALOGE("unable to malloc string");
-        exit(-1);
-    }
-    val[len] = '\0';
-    int amount = read(fd, val, len);
+    std::string val(len + 1, '\0');
+    ssize_t amount = read(fd, val.data(), len);
     if (amount != len) {
         ALOGE("unable to read string");
         exit(-1);
@@ -194,10 +208,10 @@ static char* read_string(int fd) {
     return val;
 }
 
-static void write_string(int fd, char* val) {
-    int len = strlen(val);
+static void write_string(int fd, const std::string& val) {
+    int len = static_cast<int>(val.size());
     write_int(fd, len);
-    int written = write(fd, val, len);
+    ssize_t written = write(fd, val.c_str(), len);
     if (written != len) {
         PLOGE("unable to write string");
         exit(-1);
@@ -205,17 +219,17 @@ static void write_string(int fd, char* val) {
 }
 
 static int run_daemon_child(int infd, int outfd, int errfd, int argc, char** argv) {
-    if (-1 == dup2(outfd, STDOUT_FILENO)) {
+    if (dup2(outfd, STDOUT_FILENO) == -1) {
         PLOGE("dup2 child outfd");
         exit(-1);
     }
 
-    if (-1 == dup2(errfd, STDERR_FILENO)) {
+    if (dup2(errfd, STDERR_FILENO) == -1) {
         PLOGE("dup2 child errfd");
         exit(-1);
     }
 
-    if (-1 == dup2(infd, STDIN_FILENO)) {
+    if (dup2(infd, STDIN_FILENO) == -1) {
         PLOGE("dup2 child infd");
         exit(-1);
     }
@@ -224,30 +238,29 @@ static int run_daemon_child(int infd, int outfd, int errfd, int argc, char** arg
     close(outfd);
     close(errfd);
 
-    return su_main(argc, argv, 0);
+    return su_main(argc, argv, false);
 }
 
 static int daemon_accept(int fd) {
-    is_daemon = 1;
-    int pid = read_int(fd);
+    is_daemon = true;
+    pid_t pid = read_int(fd);
     int child_result;
     ALOGD("remote pid: %d", pid);
-    char* pts_slave = read_string(fd);
-    ALOGD("remote pts_slave: %s", pts_slave);
+    std::string pts_slave = read_string(fd);
+    ALOGD("remote pts_slave: %s", pts_slave.c_str());
     daemon_from_pid = read_int(fd);
     ALOGV("remote req pid: %d", daemon_from_pid);
 
     struct ucred credentials;
     socklen_t ucred_length = sizeof(struct ucred);
-    /* fill in the user data structure */
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &ucred_length)) {
-        ALOGE("could obtain credentials from unix domain socket");
+        ALOGE("could not obtain credentials from unix domain socket");
         exit(-1);
     }
 
     daemon_from_uid = credentials.uid;
 
-    // The the FDs for each of the streams
+    // Get the FDs for each of the streams
     int infd = recv_fd(fd);
     int outfd = recv_fd(fd);
     int errfd = recv_fd(fd);
@@ -258,31 +271,25 @@ static int daemon_accept(int fd) {
         exit(-1);
     }
     ALOGV("remote args: %d", argc);
-    char** argv = (char**)malloc(sizeof(char*) * (argc + 1));
-    if (!argv) {
-        ALOGE("unable to allocate memory\n");
-        exit(-1);
-    }
-    argv[argc] = NULL;
-    int i;
-    for (i = 0; i < argc; i++) {
-        argv[i] = read_string(fd);
+
+    // Read arguments
+    std::vector<std::string> argv_strings(argc);
+    for (int i = 0; i < argc; i++) {
+        argv_strings[i] = read_string(fd);
     }
 
-    // ack
+    // Convert to char** for exec
+    std::vector<char*> argv(argc + 1, nullptr);
+    for (int i = 0; i < argc; i++) {
+        argv[i] = const_cast<char*>(argv_strings[i].c_str());
+    }
+
+    // Ack
     write_int(fd, 1);
 
-    // Fork the child process. The fork has to happen before calling
-    // setsid() and opening the pseudo-terminal so that the parent
-    // is not affected
-    int child = fork();
+    // Fork the child process
+    pid_t child = fork();
     if (child < 0) {
-        for (i = 0; i < argc; i++) {
-            free(argv[i]);
-        }
-        free(argv);
-
-        // fork failed, send a return code and bail out
         PLOGE("unable to fork");
         write(fd, &child, sizeof(int));
         close(fd);
@@ -290,16 +297,8 @@ static int daemon_accept(int fd) {
     }
 
     if (child != 0) {
-        for (i = 0; i < argc; i++) {
-            free(argv[i]);
-        }
-        free(argv);
-
-        // In parent, wait for the child to exit, and send the exit code
-        // across the wire.
+        // In parent, wait for the child to exit
         int code, status;
-
-        free(pts_slave);
 
         ALOGD("waiting for child exit");
         if (waitpid(child, &status, 0) > 0) {
@@ -308,17 +307,12 @@ static int daemon_accept(int fd) {
             code = -1;
         }
 
-        // Is the file descriptor actually open?
-        if (fcntl(fd, F_GETFD) == -1) {
-            if (errno != EBADF) {
-                return code;
+        // Check if fd is open
+        if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) {
+            ALOGD("sending code");
+            if (send(fd, &code, sizeof(int), MSG_NOSIGNAL) != sizeof(int)) {
+                PLOGE("unable to write exit code");
             }
-        }
-
-        // Pass the return code back to the client
-        ALOGD("sending code");
-        if (send(fd, &code, sizeof(int), MSG_NOSIGNAL) != sizeof(int)) {
-            PLOGE("unable to write exit code");
         }
 
         close(fd);
@@ -327,20 +321,16 @@ static int daemon_accept(int fd) {
     }
 
     // We are in the child now
-    // Close the unix socket file descriptor
     close(fd);
 
     // Become session leader
-    if (setsid() == (pid_t)-1) {
+    if (setsid() == static_cast<pid_t>(-1)) {
         PLOGE("setsid");
     }
 
-    int ptsfd;
-    if (pts_slave[0]) {
-        // Opening the TTY has to occur after the
-        // fork() and setsid() so that it becomes
-        // our controlling TTY and not the daemon's
-        ptsfd = open(pts_slave, O_RDWR);
+    int ptsfd = -1;
+    if (!pts_slave.empty()) {
+        ptsfd = open(pts_slave.c_str(), O_RDWR);
         if (ptsfd == -1) {
             PLOGE("open(pts_slave) daemon");
             exit(-1);
@@ -374,18 +364,9 @@ static int daemon_accept(int fd) {
             ALOGD("daemon: stderr using PTY");
             errfd = ptsfd;
         }
-    } else {
-        // TODO: Check system property, if PTYs are disabled,
-        // made infd the CTTY using:
-        // ioctl(infd, TIOCSCTTY, 1);
     }
-    free(pts_slave);
 
-    child_result = run_daemon_child(infd, outfd, errfd, argc, argv);
-    for (i = 0; i < argc; i++) {
-        free(argv[i]);
-    }
-    free(argv);
+    child_result = run_daemon_child(infd, outfd, errfd, argc, argv.data());
     return child_result;
 }
 
@@ -395,10 +376,7 @@ int run_daemon() {
         return -1;
     }
 
-    int fd;
-    struct sockaddr_un sun;
-
-    fd = socket(AF_LOCAL, SOCK_STREAM, 0);
+    int fd = socket(AF_LOCAL, SOCK_STREAM, 0);
     if (fd < 0) {
         PLOGE("socket");
         return -1;
@@ -408,22 +386,17 @@ int run_daemon() {
         goto err;
     }
 
-    memset(&sun, 0, sizeof(sun));
+    struct sockaddr_un sun{};
     sun.sun_family = AF_LOCAL;
-    sprintf(sun.sun_path, "%s/su-daemon", DAEMON_SOCKET_PATH);
+    snprintf(sun.sun_path, sizeof(sun.sun_path), "%s/su-daemon", DAEMON_SOCKET_PATH);
 
-    /*
-     * Delete the socket to protect from situations when
-     * something bad occured previously and the kernel reused pid from that process.
-     * Small probability, isn't it.
-     */
     unlink(sun.sun_path);
     unlink(DAEMON_SOCKET_PATH);
 
-    int previous_umask = umask(027);
+    mode_t previous_umask = umask(027);
     mkdir(DAEMON_SOCKET_PATH, 0711);
 
-    if (bind(fd, (struct sockaddr*)&sun, sizeof(sun)) < 0) {
+    if (bind(fd, reinterpret_cast<struct sockaddr*>(&sun), sizeof(sun)) < 0) {
         PLOGE("daemon bind");
         goto err;
     }
@@ -439,7 +412,7 @@ int run_daemon() {
     }
 
     int client;
-    while ((client = accept(fd, NULL, NULL)) > 0) {
+    while ((client = accept(fd, nullptr, nullptr)) > 0) {
         if (fork_zero_fucks() == 0) {
             close(fd);
             return daemon_accept(client);
@@ -454,66 +427,36 @@ err:
     return -1;
 }
 
-// List of signals which cause process termination
-static int quit_signals[] = {SIGALRM, SIGHUP, SIGPIPE, SIGQUIT, SIGTERM, SIGINT, 0};
-
-static void sighandler(__attribute__((unused)) int sig) {
+static void sighandler(int sig) {
     restore_stdin();
 
-    // Assume we'll only be called before death
-    // See note before sigaction() in set_stdin_raw()
-    //
-    // Now, close all standard I/O to cause the pumps
-    // to exit so we can continue and retrieve the exit
-    // code
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
 
-    // Put back all the default handlers
-    struct sigaction act;
-    int i;
-
-    memset(&act, '\0', sizeof(act));
+    struct sigaction act{};
     act.sa_handler = SIG_DFL;
-    for (i = 0; quit_signals[i]; i++) {
-        if (sigaction(quit_signals[i], &act, NULL) < 0) {
-            PLOGE("Error removing signal handler");
-            continue;
-        }
+    for (int sig_val : quit_signals) {
+        if (sig_val == 0) break;
+        sigaction(sig_val, &act, nullptr);
     }
 }
 
-/**
- * Setup signal handlers trap signals which should result in program termination
- * so that we can restore the terminal to its normal state and retrieve the
- * return code.
- */
-static void setup_sighandlers(void) {
-    struct sigaction act;
-    int i;
-
-    // Install the termination handlers
-    // Note: we're assuming that none of these signal handlers are already trapped.
-    // If they are, we'll need to modify this code to save the previous handler and
-    // call it after we restore stdin to its previous state.
-    memset(&act, '\0', sizeof(act));
+static void setup_sighandlers() {
+    struct sigaction act{};
     act.sa_handler = &sighandler;
-    for (i = 0; quit_signals[i]; i++) {
-        if (sigaction(quit_signals[i], &act, NULL) < 0) {
-            PLOGE("Error installing signal handler");
-            continue;
-        }
+    for (int sig_val : quit_signals) {
+        if (sig_val == 0) break;
+        sigaction(sig_val, &act, nullptr);
     }
 }
 
-int connect_daemon(int argc, char* argv[], int ppid) {
+int connect_daemon(int argc, char* argv[], pid_t ppid) {
     int ptmx = -1;
-    char pts_slave[PATH_MAX];
+    std::array<char, PATH_MAX> pts_slave{};
 
-    struct sockaddr_un sun;
+    struct sockaddr_un sun{};
 
-    // Open a socket to the daemon
     int socketfd = socket(AF_LOCAL, SOCK_STREAM, 0);
     if (socketfd < 0) {
         PLOGE("socket");
@@ -524,29 +467,24 @@ int connect_daemon(int argc, char* argv[], int ppid) {
         exit(-1);
     }
 
-    memset(&sun, 0, sizeof(sun));
     sun.sun_family = AF_LOCAL;
-    sprintf(sun.sun_path, "%s/su-daemon", DAEMON_SOCKET_PATH);
+    snprintf(sun.sun_path, sizeof(sun.sun_path), "%s/su-daemon", DAEMON_SOCKET_PATH);
 
-    if (0 != connect(socketfd, (struct sockaddr*)&sun, sizeof(sun))) {
+    if (connect(socketfd, reinterpret_cast<struct sockaddr*>(&sun), sizeof(sun)) != 0) {
         PLOGE("connect");
         exit(-1);
     }
 
     ALOGV("connecting client %d", getpid());
 
-    // Determine which one of our streams are attached to a TTY
+    // Determine which streams are attached to a TTY
     int atty = 0;
-
-    // TODO: Check a system property and never use PTYs if
-    // the property is set.
     if (isatty(STDIN_FILENO)) atty |= ATTY_IN;
     if (isatty(STDOUT_FILENO)) atty |= ATTY_OUT;
     if (isatty(STDERR_FILENO)) atty |= ATTY_ERR;
 
     if (atty) {
-        // We need a PTY. Get one.
-        ptmx = pts_open(pts_slave, sizeof(pts_slave));
+        ptmx = pts_open(pts_slave.data(), pts_slave.size());
         if (ptmx < 0) {
             PLOGE("pts_open");
             exit(-1);
@@ -555,17 +493,15 @@ int connect_daemon(int argc, char* argv[], int ppid) {
         pts_slave[0] = '\0';
     }
 
-    // Send some info to the daemon, starting with our PID
+    // Send PID
     write_int(socketfd, getpid());
-    // Send the slave path to the daemon
-    // (This is "" if we're not using PTYs)
-    write_string(socketfd, pts_slave);
-    // Parent PID
-    write_int(socketfd, ppid);
+    // Send slave path
+    write_string(socketfd, pts_slave.data());
+    // Send parent PID
+    write_int(socketfd, static_cast<int>(ppid));
 
     // Send stdin
     if (atty & ATTY_IN) {
-        // Using PTY
         send_fd(socketfd, -1);
     } else {
         send_fd(socketfd, STDIN_FILENO);
@@ -573,10 +509,7 @@ int connect_daemon(int argc, char* argv[], int ppid) {
 
     // Send stdout
     if (atty & ATTY_OUT) {
-        // Forward SIGWINCH
         watch_sigwinch_async(STDOUT_FILENO, ptmx);
-
-        // Using PTY
         send_fd(socketfd, -1);
     } else {
         send_fd(socketfd, STDOUT_FILENO);
@@ -584,7 +517,6 @@ int connect_daemon(int argc, char* argv[], int ppid) {
 
     // Send stderr
     if (atty & ATTY_ERR) {
-        // Using PTY
         send_fd(socketfd, -1);
     } else {
         send_fd(socketfd, STDERR_FILENO);
@@ -594,8 +526,7 @@ int connect_daemon(int argc, char* argv[], int ppid) {
     write_int(socketfd, argc);
 
     // Command line arguments
-    int i;
-    for (i = 0; i < argc; i++) {
+    for (int i = 0; i < argc; i++) {
         write_string(socketfd, argv[i]);
     }
 
@@ -616,4 +547,17 @@ int connect_daemon(int argc, char* argv[], int ppid) {
     ALOGD("client exited %d", code);
 
     return code;
+}
+
+// Fork that doesn't care about the child process state
+int fork_zero_fucks() {
+    pid_t pid = fork();
+    if (pid) {
+        int status;
+        waitpid(pid, &status, 0);
+        return pid;
+    } else {
+        if ((pid = fork())) exit(0);
+        return 0;
+    }
 }
